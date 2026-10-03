@@ -1,0 +1,5 @@
+.env
+node_modules/
+dist/
+functions/.env
+*serviceAccount*.json
