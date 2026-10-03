@@ -7404,23 +7404,70 @@ html[data-theme="light"] .av-body-ico{
     if(g==='mobilidade') return {reps:8,repSec:5,rest:25,sets:2};
     return {reps:12,repSec:3.5,rest:50,sets:3};
   }
-  function elevaDefaultCadencia(goal){
+  function elevaDefaultCadencia(goal, ex){
+    // Notação: ECCÊNTRICA : ISOMETRIA (fundo) : CONCÊNTRICA : ISOMETRIA (topo)
+    // Base por objetivo (slide Fitness Academy + Bompa/Poliquin)
+    // Depois ajusta por TIPO de exercício quando ex é fornecido.
     const g=String(goal||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-    if(/forca|potenc/.test(g)) return '20X0';
-    if(/hipertrof/.test(g)) return '3010';
-    if(/resist|perda|condicion|manuten|funcional/.test(g)) return '2010';
-    if(/mobil|core/.test(g)) return '2020';
-    return '2010';
+    let base = '2020';
+    if(/forca|potenc|explos/.test(g)) base = '20X0';
+    else if(/hipertrof/.test(g)) base = '2020';
+    else if(/resist|estabil|perda|condicion|manuten|funcional/.test(g)) base = '2120';
+    else if(/mobil|core|reab|inici/.test(g)) base = '3120';
+
+    // Ajuste por tipo de exercício (nome + músculos + categoria)
+    if(ex){
+      const txt = [
+        ex.name||ex.n||'',
+        ex.mus||ex.muscleGroup||'',
+        ex.cat||'',
+        ex.file||ex.f||''
+      ].join(' ').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+
+      // 1) Explosivo / pliométrico / salto → sempre explosivo na concêntrica
+      if(/jump|plyo|salto|box jump|medicine ball throw|power clean|snatch|swing|kettlebell swing|astride jump/.test(txt)){
+        return '10X0';
+      }
+      // 2) Mobilidade / alongamento → lento e controlado
+      if(/stretch|alongamento|mobilidade|mobility|yoga|pilates/.test(txt) || (ex.cat&&/mobil/i.test(ex.cat))){
+        return '3130';
+      }
+      // 3) Core / isometria / plank / vacuum → pausa no fundo + controlo
+      if(/plank|prancha|vacuum|hollow|dead bug|bird dog|pallof|core|abdominal|obliqu|recto abdominal/.test(txt)){
+        return '2120';
+      }
+      // 4) Unilateral / equilíbrio / single-leg → mais pausa e controlo
+      if(/single|unilateral|single-leg|single leg|one leg|equilibrio|balance|bulgarian|pistol/.test(txt)){
+        return (base==='20X0') ? '21X0' : '2120';
+      }
+      // 5) Isolamento (curl, extension, raise, fly) → hipertrofia controlada
+      if(/curl|extension|raise|fly|lateral raise|frontal raise|kickback|pullover/.test(txt)){
+        if(/forca|potenc/.test(g)) return '20X0';
+        return '2020';
+      }
+      // 6) Compostos pesados (squat, deadlift, bench, row, press) → respeita objetivo
+      if(/squat|deadlift|bench|row|press|hip thrust|lunge|agachamento|remada|supino|levantamento/.test(txt)){
+        return base;
+      }
+      // 7) Cardio / HIIT → ritmo mais rápido
+      if(/cardio|hiit|bike|row|run|burpee|mountain climber/.test(txt) || (ex.cat&&/cardio|hiit/i.test(ex.cat))){
+        return '10X0';
+      }
+    }
+    return base;
   }
   function elevaCalcularCadencia(ex, goal, opts){
     opts = opts || {};
     const strict = opts.strict !== false; // default true for calculations
-    const src = (ex && (ex.cadencia!=null && String(ex.cadencia).trim()!=='')) ? ex.cadencia : elevaDefaultCadencia(goal || (ex && ex.goal));
+    const src = (ex && (ex.cadencia!=null && String(ex.cadencia).trim()!=='')) ? ex.cadencia : elevaDefaultCadencia(goal || (ex && ex.goal), ex);
     let cad = String(src||'').replace(/[^0-9Xx]/g,'').toUpperCase();
     if(cad.length>4) cad = cad.slice(0,4);
     if(strict){
+      // Aceita 3 dígitos (ex: 202 ou 2:0:2 → 2020) e completa com 0 no topo
       if(cad.length===3) cad = cad+'0';
-      if(cad.length<4) cad = elevaDefaultCadencia(goal);
+      if(cad.length===2) cad = cad+'00';
+      if(cad.length===1) cad = cad+'000';
+      if(cad.length<4) cad = elevaDefaultCadencia(goal, ex);
       if(cad.length>4) cad = cad.slice(0,4);
     } else {
       // modo edição: não forçar default enquanto o utilizador escreve
@@ -7442,7 +7489,8 @@ html[data-theme="light"] .av-body-ico{
     let intencao = 'controlo';
     if(temExplosivo || tempoPorRep<=3) intencao = 'força/potência';
     if(tempoPorRep>=6) intencao = 'hipertrofia lenta';
-    if((pausaBaixo>=2) || (pausaCima>=2)) intencao = 'estabilidade/força';
+    if((pausaBaixo>=1) || (pausaCima>=1)) intencao = 'estabilidade/controlo';
+    if(exc>=2 && conc>=2 && !temExplosivo) intencao = 'hipertrofia';
     let alerta = null;
     if(tempoPorRep>8) alerta = 'Cadência muito lenta — risco de fadiga excessiva';
     if(temExplosivo && reps>15) alerta = 'Explosivo com muitas reps — qualidade pode cair';
@@ -7694,7 +7742,7 @@ html[data-theme="light"] .av-body-ico{
     for(let n=3;n<=12;n++){
       const selected=gpPickExercises(n); if(selected.length<n)continue;
       for(let sets=Math.max(2,p.sets-1);sets<=4;sets++)for(const reps of [8,10,12,15])for(const rest of [25,30,35,45,50,60,75,90,105,120]){
-        const _cad0=(typeof elevaDefaultCadencia==='function'?elevaDefaultCadencia(goal):'2010'); const exs=selected.map((e,i)=>{const _cad=(typeof elevaCalcularCadencia==='function'?elevaCalcularCadencia({reps,sets,rest,cadencia:_cad0},goal):{cadencia_normalizada:_cad0,tut_por_serie:reps*p.repSec}); return {file:e.f,name:e.n,sets,reps,cadencia:_cad.cadencia_normalizada||_cad0,execSec:_cad.tut_por_serie||reps*p.repSec,rest,transition:i<n-1?20:0,execLabel:(_cad.tut_por_serie||Math.round(reps*p.repSec))+' s',notes:'',muscleGroup:(m1&&m2)?(e._gpGroup||m1):(m1||m2||e.mus||''),referenceWeight:Number(e.referenceWeight||e.load||0)||0,referenceReps:reps,estimated1RM:0,seriesWeights:[]};});
+        const exs=selected.map((e,i)=>{const _exObj={name:e.n,n:e.n,file:e.f,f:e.f,mus:e.mus,cat:e.cat,reps,sets,rest}; const _cad0=(typeof elevaDefaultCadencia==='function'?elevaDefaultCadencia(goal,_exObj):'2020'); const _cad=(typeof elevaCalcularCadencia==='function'?elevaCalcularCadencia(Object.assign({reps,sets,rest},_exObj),goal):{cadencia_normalizada:_cad0,tut_por_serie:reps*p.repSec}); return {file:e.f,name:e.n,sets,reps,cadencia:_cad.cadencia_normalizada||_cad0,execSec:_cad.tut_por_serie||reps*p.repSec,rest,transition:i<n-1?20:0,execLabel:(_cad.tut_por_serie||Math.round(reps*p.repSec))+' s',notes:'',muscleGroup:(m1&&m2)?(e._gpGroup||m1):(m1||m2||e.mus||''),referenceWeight:Number(e.referenceWeight||e.load||0)||0,referenceReps:reps,estimated1RM:0,seriesWeights:[],cat:e.cat||'',mus:e.mus||''};});
         const total=gpTotalSeconds(exs), diff=Math.abs(total-target); let penalty=0;
         if(m1&&m2){const a=exs.filter(x=>x.muscleGroup===m1).length,b=exs.filter(x=>x.muscleGroup===m2).length; if(!a||!b)penalty+=10000; else penalty+=Math.abs(a-b)*3;}
         const score=diff+penalty; if(!best||score<best.score)best={score,total,exs};
@@ -7746,7 +7794,7 @@ html[data-theme="light"] .av-body-ico{
       const opts=options.map(o=>'<option value="'+escapeHtml(o.f)+'" '+(o.f===ex.file?'selected':'')+'>'+escapeHtml(o.n)+'</option>').join('');
       const load=gpBuildLoadPrescription(ex,p.goal);
       ex.estimated1RM=load.estimated1RM; ex.seriesWeights=load.seriesWeights; ex.referenceReps=load.referenceReps;
-      if(!ex.cadencia && typeof elevaDefaultCadencia==='function') ex.cadencia=elevaDefaultCadencia(p.goal);
+      if(!ex.cadencia && typeof elevaDefaultCadencia==='function') ex.cadencia=elevaDefaultCadencia(p.goal, ex);
       if(typeof elevaCalcularCadencia==='function'){
         const _cadR=elevaCalcularCadencia(ex,p.goal);
         ex.cadencia=_cadR.cadencia_normalizada;
@@ -7757,7 +7805,7 @@ html[data-theme="light"] .av-body-ico{
         '<td><select class="gp-ex-name" data-i="'+i+'">'+opts+'</select></td>'+
         '<td><input type="number" min="1" max="10" step="1" data-field="sets" data-i="'+i+'" value="'+(Number(ex.sets)||1)+'"></td>'+
         '<td><input type="number" min="1" max="60" step="1" data-field="reps" data-i="'+i+'" value="'+(Number(ex.reps)||0)+'"></td>'+
-        '<td><input type="text" inputmode="text" autocomplete="off" maxlength="4" title="Cadência: 4 caracteres, ex. 3010 ou 20X0. Enter para aplicar." data-field="cadencia" data-i="'+i+'" value="'+escapeHtml(String(ex.cadencia||(typeof elevaDefaultCadencia==='function'?elevaDefaultCadencia(p.goal):'2010')))+'" placeholder="3010" style="width:72px;min-width:72px;text-align:center;font-variant-numeric:tabular-nums;font-weight:700;"></td>'+
+        '<td><input type="text" inputmode="text" autocomplete="off" maxlength="4" title="Cadência: Ecêntrica-Pausa-Concêntrica-Pausa (ex. 2020). X=explosivo. Ajustada por tipo de exercício." data-field="cadencia" data-i="'+i+'" value="'+escapeHtml(String(ex.cadencia||(typeof elevaDefaultCadencia==='function'?elevaDefaultCadencia(p.goal,ex):'2020')))+'" placeholder="2020" style="width:72px;min-width:72px;text-align:center;font-variant-numeric:tabular-nums;font-weight:700;"></td>'+
         '<td><input title="Peso utilizado e número de repetições realizadas para estimar o 1RM" type="number" min="0" max="500" step="0.5" data-field="referenceWeight" data-i="'+i+'" value="'+(Number(ex.referenceWeight)||0)+'" placeholder="kg"></td>'+
         '<td><input type="number" min="1" max="60" step="1" data-field="referenceReps" data-i="'+i+'" value="'+(Number(ex.referenceReps)||Number(ex.reps)||10)+'"></td>'+
         '<td><div class="gp-load-series">'+gpLoadSeriesText(ex,p.goal)+'</div>'+(load.estimated1RM?'<small style="opacity:.7">1RM: '+load.estimated1RM+'kg · alvo: '+load.targetLoad+'kg</small>':'<small style="opacity:.7">Introduza a carga de referência</small>')+'</td>'+
@@ -11690,7 +11738,7 @@ html[data-theme="light"] .av-body-ico{
           '<div class="sp-ex-grid sp-clean-grid">'+
             '<div class="sp-ex-field"><label>Séries</label><input type="number" min="1" data-f="sets" data-i="'+i+'" value="'+(ex.sets??'')+'"></div>'+ 
             '<div class="sp-ex-field"><label>Repetições</label><input type="text" data-f="reps" data-i="'+i+'" value="'+(ex.reps??'')+'" placeholder="ex. 10 ou 8-12"></div>'+ 
-            '<div class="sp-ex-field"><label>Cadência (ex. 3010)</label><input type="text" maxlength="4" data-f="cadencia" data-i="'+i+'" value="'+escapeHtml(String(ex.cadencia||elevaDefaultCadencia(typeof spPlanLoadGoal==='function'?spPlanLoadGoal():'Hipertrofia')))+'" placeholder="3010" title="4 dígitos: excêntrica-pausa-concêntrica-pausa. X = explosivo"></div>'+ 
+            '<div class="sp-ex-field"><label>Cadência (ex. 2020)</label><input type="text" maxlength="4" data-f="cadencia" data-i="'+i+'" value="'+escapeHtml(String(ex.cadencia||elevaDefaultCadencia(typeof spPlanLoadGoal==='function'?spPlanLoadGoal():'Hipertrofia', ex)))+'" placeholder="2020" title="Ecêntrica-Pausa-Concêntrica-Pausa. X=explosivo. Ajustada automaticamente por tipo de exercício (core, salto, unilateral, etc.)"></div>'+ 
             '<div class="sp-ex-field"><label>Tempo série (s)</label><input type="number" min="0" data-f="time" data-i="'+i+'" value="'+(ex.time??'')+'" placeholder="TUT"></div>'+ 
             '<div class="sp-ex-field"><label>Descanso (s)</label><input type="number" min="0" data-f="rest" data-i="'+i+'" value="'+(ex.rest??'')+'" placeholder="60"></div>'+ 
             '<div class="sp-ex-field"><label>Carga ref. (kg)</label><input type="number" min="0" step="0.5" data-f="referenceWeight" data-i="'+i+'" value="'+(ex.referenceWeight??ex.load??'')+'" placeholder="0"></div>'+ 
