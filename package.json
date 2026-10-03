@@ -1,0 +1,14 @@
+{
+  "name": "eleva",
+  "private": true,
+  "type": "module",
+  "homepage": "https://tanago126.github.io/ELeva",
+  "scripts": {
+    "build": "node build.mjs",
+    "predeploy": "npm run build",
+    "deploy": "gh-pages -d dist"
+  },
+  "devDependencies": {
+    "gh-pages": "^6.3.0"
+  }
+}

@@ -1,0 +1,90 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function profilePath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+
+    // "Staff" = tem perfil em users/{uid}, ativo, com role válido.
+    // Quem criar uma conta no Auth por fora NÃO tem perfil → não acede a nada.
+    function isStaff() {
+      return signedIn() && exists(profilePath())
+        && get(profilePath()).data.active == true
+        && get(profilePath()).data.role in ['admin', 'trainer'];
+    }
+    function isAdmin() { return isStaff() && get(profilePath()).data.role == 'admin'; }
+
+    function ownsExisting() { return resource.data.ownerId == uid(); }
+    function ownsNew()      { return request.resource.data.ownerId == uid(); }
+
+    // ---------- users ----------
+    match /users/{userId} {
+      allow get:  if signedIn() && (uid() == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['name','initials','email','role','active','createdBy','createdAt'])
+        && request.resource.data.role in ['admin','trainer']
+        && request.resource.data.active == true
+        && request.resource.data.createdBy == uid()
+        && request.resource.data.name is string
+        && request.resource.data.initials is string;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['active','name','initials'])
+        && !(userId == uid() && request.resource.data.active == false);
+      allow delete: if false;
+    }
+
+    // ---------- alunos ----------
+    match /alunos/{docId} {
+      allow get:    if isStaff() && (resource == null || isAdmin() || ownsExisting());
+      allow list:   if isStaff() && (isAdmin() || ownsExisting());
+      allow create: if isStaff() && request.resource.data.ownerId is string && (isAdmin() || ownsNew());
+      allow update: if isStaff() && (isAdmin() ||
+                        (ownsExisting() && request.resource.data.ownerId == resource.data.ownerId));
+      allow delete: if isStaff() && (isAdmin() || ownsExisting());
+    }
+
+    // ---------- avaliacoes ----------
+    match /avaliacoes/{docId} {
+      allow get:    if isStaff() && (resource == null || isAdmin() || ownsExisting());
+      allow list:   if isStaff() && (isAdmin() || ownsExisting());
+      allow create: if isStaff() && request.resource.data.ownerId is string && (isAdmin() || ownsNew());
+      allow update: if isStaff() && (isAdmin() ||
+                        (ownsExisting() && request.resource.data.ownerId == resource.data.ownerId));
+      allow delete: if isStaff() && (isAdmin() || ownsExisting());
+    }
+
+    // ---------- eleva_data (planos, anamneses, definições…) ----------
+    // ID = "<ownerId>__<chave>"
+    match /eleva_data/{docId} {
+      allow get:    if isStaff() && (isAdmin() || docId.matches(uid() + '__.*'));
+      allow list:   if isStaff() && (isAdmin() || ownsExisting());
+      allow create, update: if isStaff() && request.resource.data.ownerId is string && (
+                        (isAdmin() && docId.matches(request.resource.data.ownerId + '__.*')) ||
+                        (ownsNew() && docId.matches(uid() + '__.*')));
+      allow delete: if isStaff() && (isAdmin() || docId.matches(uid() + '__.*'));
+    }
+
+    // ---------- portal (link do aluno, sem login) ----------
+    function publicWriteOk() {
+      return request.resource.data.keys().hasOnly(['key','value','shared','ownerId','updatedAt','kind'])
+          && request.resource.data.value is string
+          && request.resource.data.value.size() < 900000;
+    }
+    match /portal/{docId} {
+      allow get: if true;
+      allow list: if (isStaff() && (isAdmin() || ownsExisting())) || resource.data.kind == 'chat';
+
+      allow create: if (isStaff() && request.resource.data.ownerId is string && (isAdmin() || ownsNew()))
+                    || (docId.matches('share:(chat|chatmeta|access):.*') && publicWriteOk());
+      allow update: if (isStaff() && (isAdmin() ||
+                        (ownsExisting() && request.resource.data.ownerId == resource.data.ownerId)))
+                    || (docId.matches('share:(chatmeta|access):.*') && publicWriteOk());
+      allow delete: if isStaff() && (isAdmin() || ownsExisting());
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
