@@ -2945,7 +2945,7 @@ html[data-theme="light"] .av-body-ico{
   function wipeCache(){
     try{
       var ks=[]; for(var i=0;i<localStorage.length;i++) ks.push(localStorage.key(i));
-      ks.forEach(function(k){ if(k!=='ritmo:theme') localStorage.removeItem(k); });
+      ks.forEach(function(k){ if(k!=='ritmo:theme' && k!=='eleva:backfill1' && k!=='eleva:agTheme') localStorage.removeItem(k); });
     }catch(e){}
     try{ sessionStorage.clear(); }catch(e){}
   }
@@ -2960,7 +2960,6 @@ html[data-theme="light"] .av-body-ico{
     var btn = $('loginEnterBtn'); if(btn) btn.disabled = true;
     msg('A entrar…');
     f.auth.signInWithEmailAndPassword(email, pass)
-      .then(function(){ msg(''); })
       .catch(function(e){ msg(friendly(e)); })
       .then(function(){ if(btn) btn.disabled = false; });
   }
@@ -2980,6 +2979,11 @@ html[data-theme="light"] .av-body-ico{
     badge.textContent = S.initials + ' · ' + (S.role==='admin' ? 'Admin' : 'Treinador');
     badge.title = S.name + ' (' + S.email + ')';
     logout.parentNode.insertBefore(badge, logout);
+    var ag = document.createElement('button');
+    ag.id = 'elevaAgendaBtn'; ag.type = 'button'; ag.className = 'logout-link';
+    ag.textContent = '📅 Agenda'; ag.style.marginRight = '10px';
+    ag.addEventListener('click', function(){ if(window.__elevaOpenAgenda) window.__elevaOpenAgenda(); });
+    logout.parentNode.insertBefore(ag, logout);
     if(S.role==='admin'){
       var b = document.createElement('button');
       b.id = 'elevaAdminBtn'; b.type = 'button'; b.className = 'logout-link';
@@ -3040,7 +3044,10 @@ html[data-theme="light"] .av-body-ico{
             tg.type='button';
             tg.addEventListener('click', function(){
               if(u.active!==false && !confirm('Desativar '+(u.name||'esta conta')+'? Deixa de conseguir entrar.')) return;
-              f.db.collection('users').doc(doc.id).update({ active: u.active===false }).then(loadList)
+              var nb = f.db.batch(), na = (u.active===false);
+              nb.update(f.db.collection('users').doc(doc.id), { active: na });
+              nb.set(f.db.collection('directory').doc(doc.id), { name:u.name||'', initials:u.initials||'', role:u.role||'trainer', active:na });
+              nb.commit().then(loadList).then(function(){ return loadDirectory(f); })
                 .catch(function(er){ alert('Erro: '+(er.message||er)); });
             });
             right.appendChild(tg);
@@ -3070,10 +3077,13 @@ html[data-theme="light"] .av-body-ico{
         .then(function(cred){
           var uid = cred.user.uid;
           return sec.signOut().catch(function(){}).then(function(){
-            return f.db.collection('users').doc(uid).set({
+            var b = f.db.batch();
+            b.set(f.db.collection('users').doc(uid), {
               name:n, initials:i, email:e, role:r, active:true, createdBy:S.uid,
               createdAt: firebase.firestore.FieldValue.serverTimestamp()
-            }).catch(function(err){
+            });
+            b.set(f.db.collection('directory').doc(uid), { name:n, initials:i, role:r, active:true });
+            return b.commit().catch(function(err){
               err.__orphan = true; throw err;     // Auth criado mas perfil falhou
             });
           });
@@ -3094,6 +3104,26 @@ html[data-theme="light"] .av-body-ico{
     });
     ov.addEventListener('click', function(e){ if(e.target===ov) ov.remove(); });
     document.body.appendChild(ov);
+  }
+
+  function loadDirectory(f){
+    return f.db.collection('directory').get().then(function(snap){
+      var a = []; snap.forEach(function(doc){ var d = doc.data()||{}; d.uid = doc.id; a.push(d); });
+      window.__elevaDirectory = a; return a;
+    }).catch(function(e){ console.warn('directory', e); window.__elevaDirectory = window.__elevaDirectory || []; });
+  }
+  // Admin: mantém o diretório (nome, iniciais, role, ativo) igual à coleção users
+  function syncDirectory(f){
+    if(S.role!=='admin') return Promise.resolve();
+    return f.db.collection('users').get().then(function(snap){
+      var batch = f.db.batch(), n = 0;
+      snap.forEach(function(doc){
+        var u = doc.data()||{};
+        batch.set(f.db.collection('directory').doc(doc.id), { name:u.name||'', initials:u.initials||'', role:u.role||'trainer', active:u.active!==false });
+        n++;
+      });
+      return n ? batch.commit() : null;
+    }).catch(function(e){ console.warn('syncDirectory', e); });
   }
 
   function runOnLogin(){
@@ -3125,6 +3155,7 @@ html[data-theme="light"] .av-body-ico{
         hide(); msg('');
         if($('loginPass')) $('loginPass').value='';
         mountHeader();
+        syncDirectory(f).then(function(){ return loadDirectory(f); });
         runOnLogin();
       }).catch(function(e){
         console.error(e); msg('Erro a carregar o perfil.'); f.auth.signOut();
@@ -3134,6 +3165,432 @@ html[data-theme="light"] .av-body-ico{
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();
 </script>
+<script>
+/* ============ AGENDA PARTILHADA DE PTs (coleção "sessoes") ============
+   Só mostra sessões inseridas, agrupadas por dia. Treino PT · Aula de Grupo · Avaliação Física.
+   Todos os PTs veem a agenda; cada PT edita só as suas; o admin edita tudo.
+   Sem restrição de horário. */
+(function(){
+  "use strict";
+  var S = window.__elevaSession || {};
+  var MONTHS = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+  var DAYN = ['Segunda','Terça','Quarta','Quinta','Sexta','Sábado','Domingo'];
+  var KINDS = {
+    pt:        { label:'Treino PT',        sub:'1-para-1', icon:'fa-user',           color:'#38bdf8' },
+    grupo:     { label:'Aula de Grupo',    sub:'',         icon:'fa-users',          color:'#fb923c' },
+    avaliacao: { label:'Avaliação Física', sub:'',         icon:'fa-clipboard-check', color:'#c084fc' }
+  };
+  var STATUS = {
+    agendado:  { label:'Agendado',  icon:'fa-clock' },
+    concluido: { label:'Concluído', icon:'fa-circle-check' },
+    cancelado: { label:'Cancelado', icon:'fa-ban' }
+  };
+  var PALETTE = ['#4ade80','#38bdf8','#f472b6','#facc15','#a78bfa','#fb923c','#2dd4bf','#f87171'];
+  var GROUP_NAMES = ['Schwinncycling','Indoor Cycling','HIIT','Circuito','Core','Abdominais','Alongamentos','Pilates','Yoga'];
+  // Cliente e notas de sessões PT/avaliação de outros PTs aparecem como "Ocupado" (só na interface)
+  var MASK_OTHERS = true;
+  var BASE = [{"day":1,"time":"07:00","duration":45,"type":"Schwinncycling","location":"Ginásio Evolution, Montijo","instructor":"AQ","note":""},{"day":1,"time":"13:05","duration":45,"type":"Schwinncycling","location":"Ginásio Evolution, Montijo","instructor":"HA","note":""},{"day":1,"time":"17:00","duration":60,"type":"Avaliação Física","location":"Ginásio Winjoy, Torre da Marinha","instructor":"AQ","note":""},{"day":1,"time":"18:15","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":""},{"day":1,"time":"19:15","duration":45,"type":"Schwinncycling","location":"Ginásio Bombástic, Arrentela","instructor":"HA","note":""},{"day":1,"time":"21:00","duration":45,"type":"HIIT","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":""},{"day":2,"time":"07:00","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"HA","note":""},{"day":2,"time":"08:00","duration":120,"type":"Avaliação Física","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"HA","note":""},{"day":2,"time":"09:45","duration":45,"type":"Circuito","location":"Ginásio R&M, Quinta do Conde","instructor":"HA","note":""},{"day":2,"time":"10:00","duration":60,"type":"Avaliação Física","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":2,"time":"10:40","duration":45,"type":"Schwinncycling","location":"Ginásio R&M, Quinta do Conde","instructor":"HA","note":""},{"day":2,"time":"14:00","duration":120,"type":"Sala de exercício","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":2,"time":"16:00","duration":60,"type":"Avaliação Física","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":2,"time":"18:30","duration":45,"type":"Schwinncycling","location":"Ginásio Aquafitness, Marisol","instructor":"HA","note":""},{"day":2,"time":"19:25","duration":30,"type":"Schwinncycling","location":"Ginásio Aquafitness, Marisol","instructor":"HA","note":""},{"day":3,"time":"07:00","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":""},{"day":3,"time":"07:45","duration":15,"type":"Abdominais","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":""},{"day":3,"time":"13:05","duration":45,"type":"Schwinncycling","location":"Ginásio Evolution, Montijo","instructor":"HA","note":""},{"day":3,"time":"17:00","duration":60,"type":"Avaliação Física","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":3,"time":"18:15","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":3,"time":"19:15","duration":45,"type":"Schwinncycling","location":"Ginásio Bombástic, Arrentela","instructor":"HA","note":""},{"day":4,"time":"07:00","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"HA","note":""},{"day":4,"time":"08:00","duration":120,"type":"Sala de exercício","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":4,"time":"10:40","duration":45,"type":"Schwinncycling","location":"Ginásio R&M, Quinta do Conde","instructor":"HA","note":""},{"day":4,"time":"12:20","duration":45,"type":"Schwinncycling","location":"Ginásio Solinca, Quinta do Conde","instructor":"AQ","note":""},{"day":4,"time":"13:15","duration":30,"type":"Alongamentos","location":"Ginásio Solinca, Quinta do Conde","instructor":"AQ","note":""},{"day":4,"time":"18:30","duration":45,"type":"Schwinncycling","location":"Ginásio Aquafitness, Marisol","instructor":"HA","note":""},{"day":4,"time":"19:25","duration":30,"type":"Schwinncycling","location":"Ginásio Aquafitness, Marisol","instructor":"HA","note":""},{"day":5,"time":"07:00","duration":45,"type":"Schwinncycling","location":"Ginásio Evolution, Montijo","instructor":"AQ","note":"Lado a lado"},{"day":5,"time":"07:00","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":"Lado a lado"},{"day":5,"time":"07:45","duration":15,"type":"Abdominais","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":""},{"day":5,"time":"09:15","duration":45,"type":"Schwinncycling","location":"Ginásio Solinca, Quinta do Conde","instructor":"HA","note":""},{"day":5,"time":"10:15","duration":30,"type":"Core","location":"Ginásio Solinca, Quinta do Conde","instructor":"HA","note":""},{"day":5,"time":"12:45","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":5,"time":"14:00","duration":120,"type":"Sala de exercício","location":"Ginásio Winjoy Fitness Health & Longevity","instructor":"AQ","note":""},{"day":5,"time":"16:30","duration":150,"type":"Sala de exercício","location":"Ginásio Winjoy, Torre da Marinha","instructor":"AQ","note":""},{"day":5,"time":"17:30","duration":30,"type":"Circuito","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":""},{"day":5,"time":"18:15","duration":45,"type":"Schwinncycling","location":"Ginásio Winjoy, Torre da Marinha","instructor":"HA","note":""},{"day":5,"time":"19:00","duration":60,"type":"Avaliação Física","location":"Ginásio Winjoy, Torre da Marinha","instructor":"AQ","note":""}];
+
+  var db = null, unsub = null, root = null, entries = [], loadErr = '', toastT = null;
+  var weekStart = mondayOf(new Date()), fPT = 'ALL';
+
+  /* ---------- utilitários ---------- */
+  function pad(n){ return (n<10?'0':'')+n; }
+  function ymd(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+  function parseYmd(s){ var p=String(s).split('-'); return new Date(+p[0], +p[1]-1, +p[2]); }
+  function mondayOf(d){ var x=new Date(d.getFullYear(), d.getMonth(), d.getDate()); x.setDate(x.getDate()-((x.getDay()+6)%7)); return x; }
+  function addDays(d,n){ var x=new Date(d.getFullYear(), d.getMonth(), d.getDate()); x.setDate(x.getDate()+n); return x; }
+  function dm(d){ return d.getDate()+' '+MONTHS[d.getMonth()]; }
+  function toMin(t){ var p=String(t||'').split(':'); return (parseInt(p[0],10)||0)*60+(parseInt(p[1],10)||0); }
+  function fmt(m){ return pad(Math.floor(m/60)%24)+':'+pad(m%60); }
+  function dur(e){ return Math.max(0, toMin(e.end)-toMin(e.start)); }
+  function fmtH(min){ return (Math.round(min/6)/10).toString().replace('.',',')+' h'; }
+  function colorOfInstr(i){ var n=0, s=String(i||'?'); for(var k=0;k<s.length;k++) n+=s.charCodeAt(k); return PALETTE[n%PALETTE.length]; }
+  function canEdit(e){ return S.role==='admin' || e.ownerId===S.uid; }
+  function directory(){ return window.__elevaDirectory || []; }
+  function uniqSorted(a){ var o=[]; a.forEach(function(x){ if(x && o.indexOf(x)<0) o.push(x); }); return o.sort(); }
+  function el(tag, cls, text){ var e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e; }
+  function ic(name){ var i=document.createElement('i'); i.className='fa-solid '+name; i.setAttribute('aria-hidden','true'); return i; }
+  function btn(cls, iconName, label, fn, title){
+    var b = el('button','ag-btn '+(cls||'')); b.type='button';
+    if(iconName) b.appendChild(ic(iconName));
+    if(label) b.appendChild(document.createTextNode(label));
+    if(title){ b.title=title; b.setAttribute('aria-label',title); }
+    if(fn) b.addEventListener('click', fn);
+    return b;
+  }
+  function theme(){ try{ return localStorage.getItem('eleva:agTheme') || 'dark'; }catch(e){ return 'dark'; } }
+  function toast(msg, actionLabel, fn){
+    if(!root) return;
+    var old = root.querySelector('.ag-toast'); if(old) old.remove();
+    var t = el('div','ag-toast ag-noprint'); t.appendChild(el('span','',msg));
+    if(actionLabel){ var a = el('button','ag-link',actionLabel); a.type='button'; a.addEventListener('click', function(){ t.remove(); fn(); }); t.appendChild(a); }
+    root.appendChild(t);
+    clearTimeout(toastT); toastT = setTimeout(function(){ t.remove(); }, 6000);
+  }
+
+  /* ---------- estilos (com suporte a impressão) ---------- */
+  var CSS = [
+    '#elevaAgenda{--ag-bg:#0b1220;--ag-panel:#111a2e;--ag-card:#16223a;--ag-text:#e8eef9;--ag-dim:#8fa0bf;--ag-line:#26344f;--ag-accent:#22c55e;',
+    'position:fixed;inset:0;z-index:99990;background:var(--ag-bg);color:var(--ag-text);display:flex;flex-direction:column;font-family:Inter,system-ui,sans-serif;padding-top:env(safe-area-inset-top,0px)}',
+    '#elevaAgenda[data-theme=light]{--ag-bg:#f3f6fb;--ag-panel:#ffffff;--ag-card:#ffffff;--ag-text:#0f172a;--ag-dim:#5b6b86;--ag-line:#d6deec}',
+    '#elevaAgenda *{box-sizing:border-box}',
+    '.ag-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--ag-line);background:var(--ag-panel)}',
+    '.ag-title{font-weight:800;font-size:17px;display:flex;gap:8px;align-items:center;margin-right:4px}',
+    '.ag-grow{flex:1}',
+    '.ag-btn{display:inline-flex;gap:6px;align-items:center;justify-content:center;background:var(--ag-card);color:var(--ag-text);border:1px solid var(--ag-line);border-radius:10px;padding:7px 12px;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit;line-height:1.2}',
+    '.ag-btn:hover{border-color:var(--ag-accent)}',
+    '.ag-btn.primary{background:var(--ag-accent);border-color:var(--ag-accent);color:#04210f}',
+    '.ag-btn.danger{color:#f87171}',
+    '.ag-btn.sm{padding:5px 9px;font-size:12px}',
+    '.ag-btn[disabled]{opacity:.5;cursor:default}',
+    '.ag-link{background:none;border:none;color:var(--ag-accent);font-weight:800;cursor:pointer;font-family:inherit;margin-left:10px}',
+    '.ag-in{width:100%;background:var(--ag-card);color:var(--ag-text);border:1px solid var(--ag-line);border-radius:10px;padding:8px 10px;font-size:14px;font-family:inherit}',
+    '.ag-in.auto{width:auto}',
+    '.ag-range{font-weight:800;font-size:15px;min-width:120px;text-align:center}',
+    '.ag-range small{display:block;font-weight:600;color:var(--ag-dim);font-size:11px}',
+    '.ag-scroll{flex:1;overflow:auto;padding:14px 14px calc(18px + env(safe-area-inset-bottom,0px))}',
+    '.ag-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px}',
+    '.ag-stat{background:var(--ag-panel);border:1px solid var(--ag-line);border-radius:12px;padding:10px 12px}',
+    '.ag-stat b{display:block;font-size:22px;font-weight:800}',
+    '.ag-stat span{font-size:12px;color:var(--ag-dim)}',
+    '.ag-days{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px;align-items:start}',
+    '.ag-day{background:var(--ag-panel);border:1px solid var(--ag-line);border-radius:14px;padding:10px}',
+    '.ag-day.today{border-color:var(--ag-accent)}',
+    '.ag-dayh{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;font-weight:800;font-size:15px}',
+    '.ag-dayh small{color:var(--ag-dim);font-weight:600;font-size:12px}',
+    '.ag-card{position:relative;background:var(--ag-card);border:1px solid var(--ag-line);border-left:5px solid var(--k);border-radius:12px;padding:9px 10px;margin-bottom:8px}',
+    '.ag-card.st-concluido{opacity:.85}.ag-card.st-cancelado{opacity:.6}',
+    '.ag-card.st-cancelado .ag-ct{text-decoration:line-through}',
+    '.ag-card.clickable{cursor:pointer}',
+    '.ag-kind{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:var(--k);display:flex;gap:6px;align-items:center;justify-content:space-between}',
+    '.ag-ct{font-weight:800;font-size:15px;margin:3px 0}',
+    '.ag-meta{font-size:12.5px;color:var(--ag-dim);display:flex;gap:6px;align-items:center;margin-top:2px}',
+    '.ag-badge{font-size:11px;font-weight:800;color:#0b1220;border-radius:999px;padding:2px 8px}',
+    '.ag-chip{font-size:11px;font-weight:700;border-radius:999px;padding:2px 8px;border:1px solid var(--ag-line);display:inline-flex;gap:5px;align-items:center;color:var(--ag-dim)}',
+    '.ag-chip.concluido{color:#4ade80;border-color:#4ade80}.ag-chip.cancelado{color:#f87171;border-color:#f87171}',
+    '.ag-note{font-size:12.5px;margin-top:6px;padding-top:6px;border-top:1px dashed var(--ag-line);white-space:pre-wrap}',
+    '.ag-actions{display:flex;gap:6px;margin-top:8px}',
+    '.ag-empty{text-align:center;padding:50px 10px;color:var(--ag-dim)}',
+    '.ag-empty i{font-size:34px;display:block;margin-bottom:12px;opacity:.6}',
+    '.ag-modal{position:fixed;inset:0;z-index:99995;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:14px}',
+    '.ag-mc{background:var(--ag-panel);color:var(--ag-text);border:1px solid var(--ag-line);border-radius:16px;max-width:480px;width:100%;max-height:92vh;overflow:auto;padding:18px}',
+    '.ag-mc h3{margin:0 0 12px;font-size:17px}',
+    '.ag-f{display:grid;gap:10px}.ag-f label{font-size:12px;color:var(--ag-dim);display:block;margin-bottom:3px}',
+    '.ag-2{display:grid;grid-template-columns:1fr 1fr;gap:8px}',
+    '.ag-row{display:flex;gap:8px;margin-top:12px}.ag-row .ag-btn{flex:1}',
+    '.ag-err{min-height:18px;margin-top:10px;font-size:13px;font-weight:700;color:#f87171}',
+    '.ag-toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--ag-panel);color:var(--ag-text);border:1px solid var(--ag-accent);border-radius:12px;padding:10px 14px;font-size:13px;font-weight:600;z-index:99999;max-width:92vw}',
+    '.ag-printonly{display:none}',
+    '@media print{',
+    ' body>*:not(#elevaAgenda){display:none!important}',
+    ' #elevaAgenda{--ag-bg:#fff;--ag-panel:#fff;--ag-card:#fff;--ag-text:#000;--ag-dim:#444;--ag-line:#aaa;position:static!important;display:block!important;height:auto!important;overflow:visible!important;padding:0!important}',
+    ' #elevaAgenda .ag-noprint,#elevaAgenda .ag-modal,#elevaAgenda .ag-toast{display:none!important}',
+    ' #elevaAgenda .ag-printonly{display:block!important;font-size:18px;font-weight:800;margin:0 0 10px}',
+    ' #elevaAgenda .ag-scroll{overflow:visible!important;padding:0!important}',
+    ' #elevaAgenda .ag-card,#elevaAgenda .ag-day{break-inside:avoid}',
+    ' #elevaAgenda .ag-days{grid-template-columns:repeat(2,1fr)}',
+    '}'
+  ].join('\n');
+  function ensureAssets(){
+    if(!document.getElementById('agStyle')){ var st=document.createElement('style'); st.id='agStyle'; st.textContent=CSS; document.head.appendChild(st); }
+    if(!document.getElementById('agFA')){
+      var l=document.createElement('link'); l.id='agFA'; l.rel='stylesheet';
+      l.href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css'; l.crossOrigin='anonymous'; l.referrerPolicy='no-referrer';
+      document.head.appendChild(l);
+    }
+  }
+
+  /* ---------- dados (apenas a semana visível) ---------- */
+  function subscribe(){
+    if(unsub){ unsub(); unsub=null; }
+    if(!db) return;
+    var a = ymd(weekStart), b = ymd(addDays(weekStart,6));
+    loadErr = '';
+    unsub = db.collection('sessoes').where('date','>=',a).where('date','<=',b).onSnapshot(function(snap){
+      entries = [];
+      snap.forEach(function(doc){ var d=doc.data()||{}; d.id=doc.id; entries.push(d); });
+      render();
+    }, function(err){
+      loadErr = (err && err.code==='permission-denied') ? 'Sem permissão para ver a agenda (regras por publicar ou conta inativa).' : ('Erro: '+((err&&err.message)||err));
+      entries = []; render();
+    });
+  }
+  function goWeek(d){ weekStart = mondayOf(d); entries = []; subscribe(); render(); }
+
+  /* ---------- UI principal ---------- */
+  function open(){
+    if(root || !S.uid) return;
+    db = window.__elevaInitFirebase && window.__elevaInitFirebase();
+    if(!db) return;
+    ensureAssets();
+    fPT = (S.role==='admin') ? 'ALL' : (S.initials || 'ALL');
+    root = el('div'); root.id='elevaAgenda'; root.setAttribute('data-theme', theme());
+
+    var bar = el('div','ag-bar ag-noprint');
+    var tt = el('div','ag-title'); tt.appendChild(ic('fa-calendar-days')); tt.appendChild(document.createTextNode('Agenda')); bar.appendChild(tt);
+    bar.appendChild(btn('', '', '‹', function(){ goWeek(addDays(weekStart,-7)); }, 'Semana anterior'));
+    var rng = el('div','ag-range'); rng.id='agRange'; bar.appendChild(rng);
+    bar.appendChild(btn('', '', '›', function(){ goWeek(addDays(weekStart,7)); }, 'Semana seguinte'));
+    bar.appendChild(btn('', 'fa-calendar-day', 'Hoje', function(){ goWeek(new Date()); }, 'Ir para a semana atual'));
+    var jump = el('input','ag-in auto'); jump.type='date'; jump.id='agJump'; jump.title='Saltar para uma data'; jump.setAttribute('aria-label','Saltar para uma data');
+    jump.addEventListener('change', function(){ if(jump.value) goWeek(parseYmd(jump.value)); });
+    bar.appendChild(jump);
+    var sel = el('select','ag-in auto'); sel.id='agPT'; sel.title='Filtrar por PT';
+    sel.addEventListener('change', function(){ fPT = sel.value; render(); });
+    bar.appendChild(sel);
+    bar.appendChild(el('div','ag-grow'));
+    bar.appendChild(btn('primary', 'fa-plus', 'Nova sessão', function(){ openEditor(null, 'new'); }));
+    bar.appendChild(btn('', 'fa-copy', 'Copiar Semana para +7 dias', copyWeek));
+    bar.appendChild(btn('', 'fa-print', '', function(){ window.print(); }, 'Imprimir'));
+    var tb = btn('', theme()==='dark' ? 'fa-sun' : 'fa-moon', '', null, 'Alternar tema claro/escuro');
+    tb.addEventListener('click', function(){
+      var n = root.getAttribute('data-theme')==='dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', n); try{ localStorage.setItem('eleva:agTheme', n); }catch(e){}
+      tb.firstChild.className = 'fa-solid '+(n==='dark' ? 'fa-sun' : 'fa-moon');
+    });
+    bar.appendChild(tb);
+    bar.appendChild(btn('', 'fa-xmark', '', close_, 'Fechar'));
+    root.appendChild(bar);
+
+    var sc = el('div','ag-scroll'); sc.id='agBody'; root.appendChild(sc);
+    document.body.appendChild(root);
+    subscribe(); render();
+  }
+  function close_(){ if(unsub){ unsub(); unsub=null; } if(root){ root.remove(); root=null; } }
+
+  function render(){
+    if(!root) return;
+    var we = addDays(weekStart,6);
+    var rng = document.getElementById('agRange');
+    if(rng){ rng.textContent = dm(weekStart)+' - '+dm(we); var y = el('small','',weekStart.getFullYear()===we.getFullYear() ? String(we.getFullYear()) : weekStart.getFullYear()+'/'+we.getFullYear()); rng.appendChild(y); }
+    var jump = document.getElementById('agJump'); if(jump) jump.value = ymd(weekStart);
+
+    var sel = document.getElementById('agPT');
+    if(sel){
+      var opts = uniqSorted(entries.map(function(e){ return e.instructor; }).concat(directory().filter(function(u){ return u.active!==false; }).map(function(u){ return u.initials; }), [S.initials]));
+      sel.textContent='';
+      var o0 = document.createElement('option'); o0.value='ALL'; o0.textContent='Todos os PTs'; sel.appendChild(o0);
+      opts.forEach(function(v){ var o=document.createElement('option'); o.value=v; o.textContent=(v===S.initials?v+' (eu)':v); sel.appendChild(o); });
+      if(fPT!=='ALL' && opts.indexOf(fPT)<0) fPT='ALL';
+      sel.value = fPT;
+    }
+
+    var body = document.getElementById('agBody'); if(!body) return;
+    body.textContent='';
+    var ph = el('div','ag-printonly','Agenda — '+dm(weekStart)+' - '+dm(we)+' '+we.getFullYear()+(fPT!=='ALL' ? ' · '+fPT : ''));
+    body.appendChild(ph);
+    if(loadErr){ body.appendChild(el('div','ag-err',loadErr)); return; }
+
+    var vis = entries.filter(function(e){ return fPT==='ALL' || e.instructor===fPT; });
+    var active = vis.filter(function(e){ return e.status!=='cancelado'; });
+    var canc = vis.length - active.length;
+    var ptMin = 0, groups = 0, avals = 0;
+    active.forEach(function(e){ if(e.kind==='pt') ptMin += dur(e); else if(e.kind==='grupo') groups++; else if(e.kind==='avaliacao') avals++; });
+
+    var stats = el('div','ag-stats');
+    function stat(v, l){ var s=el('div','ag-stat'); s.appendChild(el('b','',v)); s.appendChild(el('span','',l)); stats.appendChild(s); }
+    stat(String(active.length), 'Sessões'+(canc ? ' (+'+canc+' canceladas)' : ''));
+    stat(fmtH(ptMin), 'Horas de PT');
+    stat(String(groups), 'Aulas de grupo');
+    stat(String(avals), 'Avaliações físicas');
+    body.appendChild(stats);
+
+    if(!vis.length){
+      var em = el('div','ag-empty'); em.appendChild(ic('fa-calendar-xmark'));
+      em.appendChild(el('div','','Sem sessões nesta semana.'));
+      var row = el('div','ag-noprint'); row.style.cssText='display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px;';
+      row.appendChild(btn('primary','fa-plus','Nova sessão', function(){ openEditor(null,'new'); }));
+      if(S.role==='admin' && BASE.length) row.appendChild(btn('','fa-download','Importar horário base nesta semana', importBase));
+      em.appendChild(row); body.appendChild(em); return;
+    }
+
+    var today = ymd(new Date());
+    var grid = el('div','ag-days');
+    for(var i=0;i<7;i++){
+      var date = ymd(addDays(weekStart,i));
+      var list = vis.filter(function(e){ return e.date===date; }).sort(function(a,b){ return toMin(a.start)-toMin(b.start) || String(a.instructor).localeCompare(String(b.instructor)); });
+      if(!list.length) continue;
+      var col = el('div','ag-day'+(date===today?' today':''));
+      var hd = el('div','ag-dayh'); hd.appendChild(el('span','',DAYN[i]+', '+dm(addDays(weekStart,i)))); hd.appendChild(el('small','',list.length+(list.length===1?' sessão':' sessões')));
+      col.appendChild(hd);
+      list.forEach(function(e){ col.appendChild(card(e)); });
+      grid.appendChild(col);
+    }
+    body.appendChild(grid);
+  }
+
+  function card(e){
+    var k = KINDS[e.kind] || KINDS.grupo, mine = canEdit(e);
+    var masked = MASK_OTHERS && !mine && e.kind!=='grupo';
+    var c = el('div','ag-card st-'+(e.status||'agendado')+((mine || !masked) ? ' clickable' : ''));
+    c.style.setProperty('--k', k.color);
+    var top = el('div','ag-kind');
+    var kl = el('span'); kl.appendChild(ic(k.icon)); kl.appendChild(document.createTextNode(' '+k.label+(k.sub?' · '+k.sub:''))); top.appendChild(kl);
+    var bd = el('span','ag-badge',e.instructor||'?'); bd.style.background = colorOfInstr(e.instructor); bd.title = e.instructorName || ''; top.appendChild(bd);
+    c.appendChild(top);
+    c.appendChild(el('div','ag-ct', masked ? 'Ocupado' : e.title));
+    var t = el('div','ag-meta'); t.appendChild(ic('fa-clock')); t.appendChild(document.createTextNode(' '+e.start+' – '+e.end+' ('+dur(e)+' min)')); c.appendChild(t);
+    if(e.location){ var l = el('div','ag-meta'); l.appendChild(ic('fa-location-dot')); l.appendChild(document.createTextNode(' '+e.location)); c.appendChild(l); }
+    var st = STATUS[e.status] || STATUS.agendado;
+    var chip = el('span','ag-chip '+(e.status||'agendado')); chip.style.marginTop='6px'; chip.appendChild(ic(st.icon)); chip.appendChild(document.createTextNode(' '+st.label));
+    c.appendChild(chip);
+    if(e.notes && !masked) c.appendChild(el('div','ag-note',e.notes));
+    if(mine){
+      var ac = el('div','ag-actions ag-noprint');
+      ac.appendChild(btn('sm','fa-pen','Editar', function(ev){ ev.stopPropagation(); openEditor(e,'edit'); }));
+      ac.appendChild(btn('sm','fa-clone','Duplicar', function(ev){ ev.stopPropagation(); openEditor(e,'dup'); }));
+      ac.appendChild(btn('sm danger','fa-trash','Eliminar', function(ev){ ev.stopPropagation(); remove(e); }));
+      c.appendChild(ac);
+      c.addEventListener('click', function(){ openEditor(e,'edit'); });
+    } else if(!masked){
+      c.addEventListener('click', function(){ openEditor(e,'view'); });
+    }
+    return c;
+  }
+
+  function remove(e){
+    if(!confirm('Eliminar "'+e.title+'" ('+e.date.slice(8)+'/'+e.date.slice(5,7)+' '+e.start+')?')) return;
+    db.collection('sessoes').doc(e.id).delete().catch(function(er){ alert('Erro: '+((er&&er.message)||er)); });
+  }
+
+  /* ---------- editor (criar / editar / duplicar / ver) ---------- */
+  function overlap(rec, ignoreId){
+    var a1 = toMin(rec.start), a2 = toMin(rec.end);
+    for(var i=0;i<entries.length;i++){
+      var o = entries[i];
+      if(o.id===ignoreId || o.ownerId!==rec.ownerId || o.date!==rec.date || o.status==='cancelado') continue;
+      if(a1 < toMin(o.end) && toMin(o.start) < a2) return o;
+    }
+    return null;
+  }
+  function openEditor(e, mode){
+    var ro = (mode==='view'), isNew = (mode==='new' || mode==='dup');
+    var m = el('div','ag-modal'), c = el('div','ag-mc'); m.appendChild(c);
+    c.appendChild(el('h3','', mode==='new' ? 'Nova sessão' : mode==='dup' ? 'Duplicar sessão' : mode==='edit' ? 'Editar sessão' : 'Sessão'));
+    function field(label, input){ var w=el('div'); w.appendChild(el('label','',label)); w.appendChild(input); return w; }
+
+    var kind = el('select','ag-in'); Object.keys(KINDS).forEach(function(k){ var o=document.createElement('option'); o.value=k; o.textContent=KINDS[k].label+(KINDS[k].sub?' ('+KINDS[k].sub+')':''); kind.appendChild(o); });
+    kind.value = e ? e.kind : 'pt';
+    var title = el('input','ag-in'); title.setAttribute('list','agNames'); title.maxLength = 80; title.value = e ? e.title : '';
+    var dl = document.createElement('datalist'); dl.id='agNames';
+    function fillNames(){
+      dl.textContent='';
+      var arr = kind.value==='grupo' ? uniqSorted(GROUP_NAMES.concat(entries.filter(function(x){ return x.kind==='grupo'; }).map(function(x){ return x.title; }))) : [];
+      arr.forEach(function(n){ var o=document.createElement('option'); o.value=n; dl.appendChild(o); });
+      title.placeholder = kind.value==='grupo' ? 'Nome da aula (ex.: Indoor Cycling)' : 'Nome do cliente';
+    }
+    kind.addEventListener('change', fillNames); fillNames();
+    var date = el('input','ag-in'); date.type='date'; date.value = e ? e.date : ymd(new Date());
+    var start = el('input','ag-in'); start.type='time'; start.value = e ? e.start : '09:00';
+    var end = el('input','ag-in'); end.type='time'; end.value = e ? e.end : '10:00';
+    var lastDur = Math.max(5, toMin(end.value)-toMin(start.value));
+    start.addEventListener('change', function(){ if(start.value) end.value = fmt(Math.min(1439, toMin(start.value)+lastDur)); });
+    end.addEventListener('change', function(){ var d=toMin(end.value)-toMin(start.value); if(d>0) lastDur=d; });
+    var loc = el('input','ag-in'); loc.setAttribute('list','agLocs'); loc.maxLength = 80; loc.value = e ? (e.location||'') : ''; loc.placeholder='Ex.: Estúdio 2 / Sala de exercício';
+    var dl2 = document.createElement('datalist'); dl2.id='agLocs';
+    uniqSorted(entries.map(function(x){ return x.location; }).concat(BASE.map(function(x){ return x.location; }))).forEach(function(n){ var o=document.createElement('option'); o.value=n; dl2.appendChild(o); });
+    var status = el('select','ag-in'); Object.keys(STATUS).forEach(function(k){ var o=document.createElement('option'); o.value=k; o.textContent=STATUS[k].label; status.appendChild(o); });
+    status.value = (e && mode!=='dup') ? (e.status||'agendado') : 'agendado';
+    var notes = el('textarea','ag-in'); notes.rows=3; notes.maxLength=1000; notes.value = e ? (e.notes||'') : ''; notes.placeholder='Notas de treino (opcional)';
+    var who = null;
+    if(S.role==='admin'){
+      who = el('select','ag-in');
+      directory().filter(function(u){ return u.active!==false; }).forEach(function(u){ var o=document.createElement('option'); o.value=u.uid; o.textContent=(u.initials||'?')+' · '+(u.name||''); who.appendChild(o); });
+      who.value = e ? e.ownerId : S.uid;
+    }
+
+    var f = el('div','ag-f');
+    f.appendChild(field('Tipo de serviço', kind)); f.appendChild(field('Nome do cliente / aula', title)); f.appendChild(dl); f.appendChild(dl2);
+    if(who) f.appendChild(field('PT', who));
+    f.appendChild(field('Data', date));
+    var r = el('div','ag-2'); r.appendChild(field('Início', start)); r.appendChild(field('Fim', end)); f.appendChild(r);
+    f.appendChild(field('Localização / Estúdio', loc)); f.appendChild(field('Estado', status)); f.appendChild(field('Notas de treino', notes));
+    c.appendChild(f);
+    var err = el('div','ag-err'); c.appendChild(err);
+
+    var row = el('div','ag-row');
+    if(!ro){
+      var save = btn('primary','fa-check','Guardar', function(){
+        var T = title.value.trim();
+        if(!T) return err.textContent='Indica o nome do cliente ou da aula.';
+        if(!date.value) return err.textContent='Indica a data.';
+        if(!start.value || !end.value) return err.textContent='Indica a hora de início e de fim.';
+        if(toMin(end.value) <= toMin(start.value)) return err.textContent='A hora de fim tem de ser depois do início.';
+        var owner = who ? who.value : (e && mode==='edit' ? e.ownerId : S.uid);
+        var u = directory().filter(function(x){ return x.uid===owner; })[0] || {};
+        var ini = (owner===S.uid) ? (S.initials||u.initials||'?') : (u.initials||'?');
+        var nm = (owner===S.uid) ? (S.name||u.name||'') : (u.name||'');
+        var rec = { ownerId:owner, instructor:String(ini).slice(0,4), instructorName:String(nm).slice(0,80), kind:kind.value, title:T.slice(0,80),
+                    date:date.value, start:start.value, end:end.value, location:loc.value.trim().slice(0,80), status:status.value, notes:notes.value.trim().slice(0,1000), updatedAt:Date.now() };
+        var ov = overlap(rec, mode==='edit' ? e.id : null);
+        if(ov && !confirm('Sobrepõe-se com "'+ov.title+'" ('+ov.start+'–'+ov.end+'). Guardar mesmo assim?')) return;
+        save.disabled = true; err.style.color='var(--ag-dim)'; err.textContent='A guardar…';
+        var ref = (mode==='edit') ? db.collection('sessoes').doc(e.id) : db.collection('sessoes').doc();
+        ref.set(rec).then(function(){
+          m.remove();
+          var d = parseYmd(rec.date);
+          if(ymd(mondayOf(d)) !== ymd(weekStart)) goWeek(d);
+        }).catch(function(er){ save.disabled=false; err.style.color=''; err.textContent='Erro: '+((er&&er.message)||er); });
+      });
+      row.appendChild(save);
+      if(mode==='edit') row.appendChild(btn('danger','fa-trash','Eliminar', function(){ remove(e); m.remove(); }));
+    } else {
+      [kind,title,date,start,end,loc,status,notes].forEach(function(x){ x.disabled=true; });
+    }
+    row.appendChild(btn('', 'fa-xmark', ro ? 'Fechar' : 'Cancelar', function(){ m.remove(); }));
+    c.appendChild(row);
+    m.addEventListener('click', function(ev){ if(ev.target===m) m.remove(); });
+    root.appendChild(m);
+  }
+
+  /* ---------- copiar semana (+7 dias) ---------- */
+  function sig(s){ return [s.ownerId, s.kind, s.title, s.date, s.start, s.end].join('|'); }
+  function copyWeek(){
+    var src = entries.filter(function(e){ return canEdit(e) && e.status!=='cancelado' && (fPT==='ALL' || e.instructor===fPT); });
+    if(!src.length){ alert('Não há sessões tuas (não canceladas) nesta semana para copiar.'); return; }
+    var nextStart = addDays(weekStart,7), a = ymd(nextStart), b = ymd(addDays(nextStart,6));
+    db.collection('sessoes').where('date','>=',a).where('date','<=',b).get().then(function(snap){
+      var have = {}; snap.forEach(function(doc){ have[sig(doc.data()||{})] = 1; });
+      var recs = [], dup = 0;
+      src.forEach(function(e){
+        var r = { ownerId:e.ownerId, instructor:e.instructor, instructorName:e.instructorName||'', kind:e.kind, title:e.title,
+                  date:ymd(addDays(parseYmd(e.date),7)), start:e.start, end:e.end, location:e.location||'', status:'agendado', notes:e.notes||'', updatedAt:Date.now() };
+        if(have[sig(r)]) dup++; else recs.push(r);
+      });
+      if(!recs.length){ alert('Estas sessões já existem na semana seguinte ('+dm(nextStart)+' - '+dm(addDays(nextStart,6))+').'); return; }
+      var ignored = entries.filter(function(e){ return e.status==='cancelado' && canEdit(e); }).length;
+      if(!confirm('Copiar '+recs.length+' sessões para '+dm(nextStart)+' - '+dm(addDays(nextStart,6))+'?'+(dup?'\n('+dup+' já existiam e ficam de fora.)':'')+(ignored?'\n('+ignored+' canceladas não são copiadas.)':'')+'\nAs cópias ficam como "Agendado".')) return;
+      var batch = db.batch();
+      recs.forEach(function(r){ batch.set(db.collection('sessoes').doc(), r); });
+      return batch.commit().then(function(){
+        toast(recs.length+' sessões copiadas.', 'Ver semana seguinte', function(){ goWeek(nextStart); });
+      });
+    }).catch(function(er){ alert('Erro ao copiar: '+((er&&er.message)||er)); });
+  }
+
+  /* ---------- importar horário base para a semana visível (admin) ---------- */
+  function importBase(ev){
+    if(S.role!=='admin' || !db) return;
+    var dirv = directory(), missing = {}, recs = [];
+    BASE.forEach(function(b){
+      var u = dirv.filter(function(x){ return x.initials===b.instructor && x.active!==false; })[0];
+      if(!u){ missing[b.instructor]=1; return; }
+      var kind = b.type==='Avaliação Física' ? 'avaliacao' : (b.type==='Sala de exercício' ? 'pt' : 'grupo');
+      recs.push({ ownerId:u.uid, instructor:b.instructor, instructorName:u.name||'', kind:kind, title:b.type,
+                  date:ymd(addDays(weekStart,b.day-1)), start:b.time, end:fmt(toMin(b.time)+b.duration), location:b.location, status:'agendado', notes:b.note||'', updatedAt:Date.now() });
+    });
+    var miss = Object.keys(missing);
+    if(!recs.length){ alert('Não encontrei contas com as iniciais '+miss.join(', ')+'. Cria primeiro as contas em Contas.'); return; }
+    if(!confirm('Importar '+recs.length+' sessões para '+dm(weekStart)+' - '+dm(addDays(weekStart,6))+'?'+(miss.length?'\n(As de '+miss.join(', ')+' ficam de fora: sem conta.)':''))) return;
+    var batch = db.batch(); recs.forEach(function(r){ batch.set(db.collection('sessoes').doc(), r); });
+    batch.commit().catch(function(er){ alert('Erro: '+((er&&er.message)||er)); });
+  }
+
+  window.__elevaOpenAgenda = open;
+})();
+</script>
+
 
 <div style="max-width:1100px; margin:0 auto; padding:20px 24px 0;">
   <div class="brand">
@@ -3634,6 +4091,11 @@ html[data-theme="light"] .av-body-ico{
       </div>
       <label style="display:block; font-size:12px; color:var(--text-dim); margin:12px 0 6px;">Observações</label>
       <textarea id="spStNotes" rows="3" style="width:100%; background:var(--panel-2); border:1px solid var(--line); border-radius:var(--radius); color:var(--text); font-size:14px; padding:10px 12px; font-family:'Inter',sans-serif; resize:vertical;"></textarea>
+      <div id="spShareBox" style="display:none; margin-top:16px; padding:12px; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel-2);">
+        <div style="font-size:13px; font-weight:700; margin-bottom:6px;">👥 Partilhar este aluno com</div>
+        <div id="spShareList" style="display:flex; flex-direction:column; gap:6px; font-size:14px;"></div>
+        <div class="eval-hint" style="margin-top:8px;">As contas escolhidas veem e editam este aluno e os seus dados (planos, avaliações, anamnese…). O admin tem sempre acesso a todos os alunos.</div>
+      </div>
       <button class="save-btn" id="spSaveStudentBtn" style="margin-top:14px;">GUARDAR ALUNO</button>
       <div class="eval-hint" id="spStMsg" style="margin-top:8px;"></div>
     </div>
@@ -4912,8 +5374,10 @@ html[data-theme="light"] .av-body-ico{
   "use strict";
 
   /* ============ FIREBASE (Auth + Firestore, multi-utilizador) ============
-     Coleções: users · alunos · avaliacoes · eleva_data (planos, anamneses, definições…) · portal (link do aluno).
-     Cada documento tem ownerId; as Security Rules garantem o isolamento (ver firestore.rules).
+     Coleções: users · directory · alunos · avaliacoes · eleva_data · portal · agenda · config.
+     Cada documento tem ownerId (dono) e members (uids com acesso). O admin vê tudo (Security Rules).
+     Alunos partilhados: o dono escolhe contas em student.sharedWith; members = [dono, ...sharedWith]
+     e todos os dados desse aluno (planos, avaliações, anamnese…) herdam esses members.
      A config vem do .env (injetada no build). A cache local (localStorage) é limpa ao trocar de utilizador. */
   const FIREBASE_CONFIG = window.__ELEVA_CFG || {};
   const SESSION = window.__elevaSession || (window.__elevaSession = { uid:null, role:null });
@@ -4923,12 +5387,12 @@ html[data-theme="light"] .av-body-ico{
   let fbReady = false;
   let fbLastError = null;
   let fbDisabled = false;
-  const OWNER_BY_STUDENT = {};   // 'student:123' -> uid do treinador dono
-  let STUDENT_OWNER = '';        // modo portal: dono do aluno (lido dos docs partilhados)
+  const OWNER_BY_STUDENT = {};     // 'student:123' -> uid do dono
+  const MEMBERS_BY_STUDENT = {};   // 'student:123' -> [uids com acesso]
+  let STUDENT_OWNER = '';          // modo portal: dono do aluno
+  let STUDENT_MEMBERS_PUB = [];    // modo portal: members do aluno
 
-  function fbDocId(key){
-    return String(key||'').replace(/\//g, '__');
-  }
+  function fbDocId(key){ return String(key||'').replace(/\//g, '__'); }
 
   try{
     if(window.__elevaInitFirebase){
@@ -4956,6 +5420,17 @@ html[data-theme="light"] .av-body-ico{
     fbLastError = e;
     if(/permission|insufficient/i.test(m)) console.warn('Firestore: permissão negada.', m);
   }
+  // Fila de escrita: mantém a ordem das gravações na cloud
+  let cloudQ = Promise.resolve();
+  function enqueue(fn){
+    cloudQ = cloudQ.then(fn).catch(noteFbError);
+    return cloudQ;
+  }
+  function uniq(a){ const o=[]; (a||[]).forEach(x=>{ if(x && o.indexOf(x)<0) o.push(x); }); return o; }
+  function sameSet(a,b){
+    a = uniq(a).sort(); b = uniq(b).sort();
+    return a.length===b.length && a.every((x,i)=>x===b[i]);
+  }
 
   /* ---------- roteamento chave → coleção/documento ---------- */
   function lsKey(key, shared){ return (shared?'shared::':'')+key; }
@@ -4963,9 +5438,15 @@ html[data-theme="light"] .av-body-ico{
     const m = /student:[A-Za-z0-9_-]+/.exec(String(key));
     return m ? m[0] : null;
   }
+  function isStudentKey(key){ return /^student:[A-Za-z0-9_-]+$/.test(String(key)); }
+  function studentIdOf(key, val){
+    if(isStudentKey(key)) return key;
+    if(val && typeof val==='object' && typeof val.studentId==='string' && val.studentId.indexOf('student:')===0) return val.studentId;
+    return studentIdIn(key);
+  }
   function collectionFor(key, shared){
     if(shared) return 'portal';
-    if(/^student:[A-Za-z0-9_-]+$/.test(key)) return 'alunos';
+    if(isStudentKey(key)) return 'alunos';
     if(/^avaliacao:/.test(key)) return 'avaliacoes';
     return FB_COLLECTION;
   }
@@ -4976,18 +5457,29 @@ html[data-theme="light"] .av-body-ico{
     if(prefix==='') return ['alunos','avaliacoes',FB_COLLECTION];
     return [FB_COLLECTION];
   }
-  // Dono do registo: treinador → ele próprio; admin → dono do aluno a que o registo pertence (senão o próprio admin)
+  // Dono do registo: o dono do aluno a que pertence; senão, quem está a gravar
   function resolveOwner(key, val){
     if(!SESSION.uid) return STUDENT_OWNER || '';
-    if(SESSION.role !== 'admin') return SESSION.uid;
-    const sid = (val && typeof val==='object' && val.studentId) || studentIdIn(key);
+    const sid = studentIdOf(key, val);
     return (sid && OWNER_BY_STUDENT[sid]) || SESSION.uid;
+  }
+  function membersFor(col, key, val, owner){
+    if(col==='alunos'){
+      return uniq([owner].concat((val && Array.isArray(val.sharedWith)) ? val.sharedWith : []));
+    }
+    const sid = studentIdOf(key, val);
+    if(!SESSION.uid && sid) return uniq([owner].concat(STUDENT_MEMBERS_PUB));
+    const known = sid && MEMBERS_BY_STUDENT[sid];
+    return uniq([owner].concat(known || []));
   }
   function docIdFor(col, key, owner){
     return col===FB_COLLECTION ? (owner+'__'+fbDocId(key)) : fbDocId(key);
   }
   function buildDoc(col, key, val, shared, owner){
-    const d = { key: key, value: JSON.stringify(val), shared: !!shared, ownerId: owner, updatedAt: Date.now() };
+    const d = { key: key, value: JSON.stringify(val), shared: !!shared, ownerId: owner,
+                members: membersFor(col, key, val, owner), updatedAt: Date.now() };
+    const sid = studentIdOf(key, val);
+    if(sid) d.studentId = sid;
     if(col==='alunos') d.nome = String((val && (val.name||val.nome)) || '').slice(0,120);
     if(col==='avaliacoes') d.alunoId = (val && val.studentId) || '';
     if(col==='portal' && key.indexOf('share:chat:')===0) d.kind = 'chat';
@@ -5001,7 +5493,7 @@ html[data-theme="light"] .av-body-ico{
         const k2 = 'share:access:'+key.slice('share:tokenmap:'.length);
         return { col:'portal', id:fbDocId(k2), data:{
           key:k2, value:JSON.stringify({ lastAccess:(val && val.lastAccess) || Date.now() }),
-          shared:true, ownerId:STUDENT_OWNER||'', updatedAt:Date.now() } };
+          shared:true, ownerId:STUDENT_OWNER||'', members:uniq([STUDENT_OWNER].concat(STUDENT_MEMBERS_PUB)), updatedAt:Date.now() } };
       }
       if(key.indexOf('share:chat')!==0) return null;
     }
@@ -5009,11 +5501,50 @@ html[data-theme="light"] .av-body-ico{
     const owner = resolveOwner(key, val);
     return { col:col, id:docIdFor(col, key, owner), data:buildDoc(col, key, val, shared, owner) };
   }
-  function rememberOwner(key, d, col, shared){
-    if(col==='alunos') OWNER_BY_STUDENT[key] = d.ownerId;
-    if(shared && !SESSION.uid && d.ownerId) STUDENT_OWNER = d.ownerId;
+  function rememberDoc(key, d, col){
+    if(col==='alunos'){
+      OWNER_BY_STUDENT[key] = d.ownerId;
+      MEMBERS_BY_STUDENT[key] = uniq(d.members && d.members.length ? d.members : [d.ownerId]);
+    }
+    if(col==='portal' && !SESSION.uid && d.ownerId){
+      STUDENT_OWNER = d.ownerId;
+      if(Array.isArray(d.members)) STUDENT_MEMBERS_PUB = d.members;
+    }
   }
   function cloudAllowed(){ return !!fbDb && !fbDisabled && (!!SESSION.uid || PORTAL_MODE); }
+  function scopedQuery(col){
+    let q = fbDb.collection(col);
+    if(SESSION.role !== 'admin') q = q.where('members','array-contains',SESSION.uid);
+    return q;
+  }
+
+  /** Dono ou admin podem gerir (apagar / mudar partilha) um aluno */
+  window.__elevaCanManage = function(sid){
+    if(SESSION.role==='admin') return true;
+    const o = OWNER_BY_STUDENT[sid];
+    return !o || o===SESSION.uid;
+  };
+  window.__elevaOwnerOf = function(sid){ return OWNER_BY_STUDENT[sid] || null; };
+
+  // Quando a lista de partilha muda, os dados do aluno herdam os novos members
+  async function propagateMembers(sid, members){
+    if(!fbDb || !SESSION.uid) return;
+    const admin = SESSION.role==='admin';
+    for(const col of ['eleva_data','avaliacoes','portal']){
+      let q = fbDb.collection(col);
+      q = admin ? q.where('studentId','==',sid) : q.where('members','array-contains',SESSION.uid);
+      const snap = await q.get();
+      let batch = fbDb.batch(), n = 0; const commits = [];
+      snap.forEach(doc=>{
+        const d = doc.data() || {};
+        if(d.studentId !== sid || sameSet(d.members, members)) return;
+        batch.update(doc.ref, { members: members }); n++;
+        if(n>=400){ commits.push(batch.commit()); batch = fbDb.batch(); n = 0; }
+      });
+      if(n) commits.push(batch.commit());
+      await Promise.all(commits);
+    }
+  }
 
   /* ---------- API de armazenamento (assinaturas inalteradas) ---------- */
   async function storageSet(key, val, shared){
@@ -5025,14 +5556,14 @@ html[data-theme="light"] .av-body-ico{
       return false;
     }
     if(cloudAllowed()){
-      Promise.resolve().then(async ()=>{
-        try{
-          if(!SESSION.uid) await ensureStudentOwner(key, val);
-          const r = routeWrite(key, val, shared);
-          if(!r) return;
-          if(r.col==='alunos') OWNER_BY_STUDENT[key] = r.data.ownerId;
-          await withTimeout(fbDb.collection(r.col).doc(r.id).set(r.data), 4000);
-        }catch(e){ noteFbError(e); }
+      enqueue(async ()=>{
+        if(!SESSION.uid) await ensureStudentOwner(key, val);
+        const r = routeWrite(key, val, shared);
+        if(!r) return;
+        let prev = null;
+        if(r.col==='alunos'){ prev = MEMBERS_BY_STUDENT[key]; rememberDoc(key, r.data, 'alunos'); }
+        await withTimeout(fbDb.collection(r.col).doc(r.id).set(r.data), 6000);
+        if(prev && !sameSet(prev, r.data.members)) await propagateMembers(key, r.data.members);
       });
     }
     if(shared && window.storage){
@@ -5040,14 +5571,14 @@ html[data-theme="light"] .av-body-ico{
     }
     return true;
   }
-  // Portal: descobre o dono do aluno a partir do snapshot público (para o chat ficar visível ao treinador)
+  // Portal: descobre dono e members do aluno a partir do snapshot público (para o chat ficar visível aos PTs)
   async function ensureStudentOwner(key, val){
     if(SESSION.uid || STUDENT_OWNER || !fbDb) return;
-    const sid = (val && typeof val==='object' && val.studentId) || studentIdIn(key);
+    const sid = studentIdOf(key, val);
     if(!sid) return;
     try{
       const doc = await withTimeout(fbDb.collection('portal').doc(fbDocId('share:portal:'+sid)).get(), 2500);
-      if(doc && doc.exists && doc.data().ownerId) STUDENT_OWNER = doc.data().ownerId;
+      if(doc && doc.exists) rememberDoc(sid, doc.data(), 'portal');
     }catch(e){}
   }
 
@@ -5059,7 +5590,7 @@ html[data-theme="light"] .av-body-ico{
       if(v!=null){ hit = true; try{ local = JSON.parse(v); }catch(e){ local = v; } }
     }catch(e){}
 
-    // treinador a ler o token do aluno: junta o "último acesso" que o aluno regista à parte
+    // PT a ler o token do aluno: junta o "último acesso" que o aluno regista à parte
     if(hit && shared && SESSION.uid && fbDb && key.indexOf('share:tokenmap:')===0 && local && typeof local==='object'){
       try{
         const ad = await withTimeout(fbDb.collection('portal').doc(fbDocId('share:access:'+key.slice('share:tokenmap:'.length))).get(), 2000);
@@ -5073,10 +5604,10 @@ html[data-theme="light"] .av-body-ico{
         const col = collectionFor(key, shared);
         const owner = SESSION.uid ? resolveOwner(key, null) : '';
         if(!(col===FB_COLLECTION && !owner)){
-          const doc = await withTimeout(fbDb.collection(col).doc(docIdFor(col, key, owner)).get(), 2000);
+          const doc = await withTimeout(fbDb.collection(col).doc(docIdFor(col, key, owner)).get(), 2500);
           if(doc && doc.exists){
             const d = doc.data() || {};
-            rememberOwner(key, d, col, shared);
+            rememberDoc(key, d, col);
             const raw = d.value;
             const val = (typeof raw==='string') ? JSON.parse(raw) : raw;
             try{ localStorage.setItem(lsKey(key, shared), JSON.stringify(val)); }catch(e){}
@@ -5108,13 +5639,11 @@ html[data-theme="light"] .av-body-ico{
     if(cloudAllowed()){
       try{
         for(const col of listCollections(prefix, shared)){
-          let q = fbDb.collection(col);
-          if(SESSION.uid){
-            if(SESSION.role !== 'admin') q = q.where('ownerId','==',SESSION.uid);
-          } else if(col==='portal' && prefix.indexOf('share:chat:')===0){
-            q = q.where('kind','==','chat');      // aluno: só mensagens de chat
-          } else { continue; }
-          const snap = await withTimeout(q.get(), 4000);
+          let q;
+          if(SESSION.uid){ q = scopedQuery(col); }
+          else if(col==='portal' && prefix.indexOf('share:chat:')===0){ q = fbDb.collection(col).where('kind','==','chat'); }
+          else { continue; }
+          const snap = await withTimeout(q.get(), 5000);
           if(snap) snap.forEach(doc=>{
             const d = doc.data() || {};
             const k = d.key || doc.id;
@@ -5135,39 +5664,63 @@ html[data-theme="light"] .av-body-ico{
     shared = !!shared;
     try{ localStorage.removeItem(lsKey(key, shared)); }catch(e){}
     if(fbDb && SESSION.uid){
-      try{
+      enqueue(async ()=>{
         const col = collectionFor(key, shared);
         const owner = resolveOwner(key, null);
-        await withTimeout(fbDb.collection(col).doc(docIdFor(col, key, owner)).delete(), 2500);
-      }catch(e){ noteFbError(e); }
+        await withTimeout(fbDb.collection(col).doc(docIdFor(col, key, owner)).delete(), 4000);
+        if(col==='alunos'){ delete OWNER_BY_STUDENT[key]; delete MEMBERS_BY_STUDENT[key]; }
+      });
     }
     try{ if(window.storage){ await window.storage.delete(key, shared); } }catch(e){}
   }
 
   /* ---------- sincronização no login ---------- */
   async function loadOwnerMap(){
-    if(!fbDb || SESSION.role!=='admin') return;
-    const snap = await fbDb.collection('alunos').get();
-    snap.forEach(doc=>{ const d = doc.data()||{}; if(d.key) OWNER_BY_STUDENT[d.key] = d.ownerId; });
+    if(!fbDb || !SESSION.uid) return;
+    const snap = await scopedQuery('alunos').get();
+    snap.forEach(doc=>{ const d = doc.data()||{}; if(d.key) rememberDoc(d.key, d, 'alunos'); });
   }
   async function hydrateFromCloud(){
     if(!fbDb || !SESSION.uid) return 0;
     const isAdmin = SESSION.role==='admin';
     let n = 0;
     for(const col of ['alunos','avaliacoes',FB_COLLECTION,'portal']){
-      let q = fbDb.collection(col);
-      if(!isAdmin) q = q.where('ownerId','==',SESSION.uid);
-      const snap = await q.get();
+      const snap = await scopedQuery(col).get();
       snap.forEach(doc=>{
         const d = doc.data() || {};
         const k = d.key;
         if(!k || typeof d.value!=='string') return;
         if(isAdmin && col===FB_COLLECTION && d.ownerId!==SESSION.uid && /^(settings:|ritmo\.)/.test(k)) return; // definições são por utilizador
-        if(col==='alunos') OWNER_BY_STUDENT[k] = d.ownerId;
+        rememberDoc(k, d, col);
         try{ localStorage.setItem(lsKey(k, col==='portal'), d.value); n++; }catch(e){}
       });
     }
     return n;
+  }
+  // Admin (uma vez por browser): dá `members`/`studentId` aos documentos criados antes da partilha
+  async function backfillMembers(){
+    if(!fbDb || SESSION.role!=='admin') return;
+    if(localStorage.getItem('eleva:backfill1')) return;
+    const fix = async (col)=>{
+      const snap = await fbDb.collection(col).get();
+      let batch = fbDb.batch(), n = 0; const commits = [];
+      snap.forEach(doc=>{
+        const d = doc.data() || {};
+        const patch = {};
+        if(!Array.isArray(d.members)){
+          const sid = d.studentId || studentIdOf(d.key||'', null);
+          patch.members = uniq([d.ownerId].concat((col!=='alunos' && sid && MEMBERS_BY_STUDENT[sid]) || []));
+        }
+        if(!d.studentId && col!=='alunos'){ const sid2 = studentIdOf(d.key||'', null); if(sid2) patch.studentId = sid2; }
+        if(Object.keys(patch).length){ batch.update(doc.ref, patch); n++; if(n>=400){ commits.push(batch.commit()); batch = fbDb.batch(); n = 0; } }
+      });
+      if(n) commits.push(batch.commit());
+      await Promise.all(commits);
+    };
+    await fix('alunos');
+    await loadOwnerMap();
+    for(const c of ['avaliacoes',FB_COLLECTION,'portal']) await fix(c);
+    localStorage.setItem('eleva:backfill1','1');
   }
   const LEGACY_KEY_RE = /^(student|plan|avaliacao|anamnese|history|nutrition|cardiotest|ftptest|corretivo|condesp|settings|supplements|supplementHistory|labs|nutfollow|condprofile):|^ritmo\.exerciseLibrary/;
   function hasLegacyLocalData(){
@@ -5212,6 +5765,7 @@ html[data-theme="light"] .av-body-ico{
       }
       localStorage.setItem('eleva:cacheUid', uid);
       await loadOwnerMap();
+      try{ await backfillMembers(); }catch(e){ console.warn('backfill', e); }
       if(sessionStorage.getItem('eleva:hydrated') !== uid){
         await hydrateFromCloud();
         sessionStorage.setItem('eleva:hydrated', uid);
@@ -5237,6 +5791,8 @@ html[data-theme="light"] .av-body-ico{
         keys.push(k);
       }
     }catch(e){}
+    // alunos primeiro, para os restantes herdarem dono/members
+    keys.sort((a,b)=> (isStudentKey(b)?1:0) - (isStudentKey(a)?1:0));
     for(const k of keys){
       try{
         const shared = k.indexOf('shared::')===0;
@@ -5248,7 +5804,7 @@ html[data-theme="light"] .av-body-ico{
         const r = routeWrite(realKey, val, shared);
         if(!r) continue;
         await fbDb.collection(r.col).doc(r.id).set(Object.assign({}, r.data, { migratedAt: Date.now() }));
-        if(r.col==='alunos') OWNER_BY_STUDENT[realKey] = r.data.ownerId;
+        if(r.col==='alunos') rememberDoc(realKey, r.data, 'alunos');
         uploaded++;
       }catch(e){
         console.error('migrate fail', k, e);
@@ -9718,6 +10274,30 @@ html[data-theme="light"] .av-body-ico{
     document.getElementById('spStPhotoInput').value = '';
   });
 
+  window.__spRenderShare = function(selected, sid){
+    const box = document.getElementById('spShareBox'), list = document.getElementById('spShareList');
+    if(!box || !list) return;
+    const S0 = window.__elevaSession || {};
+    if(!S0.uid || (sid && window.__elevaCanManage && !window.__elevaCanManage(sid))){ box.style.display = 'none'; return; }
+    const owner = (sid && window.__elevaOwnerOf && window.__elevaOwnerOf(sid)) || S0.uid;
+    const dir = (window.__elevaDirectory || []).filter(u=>u.role==='trainer' && u.active!==false && u.uid!==owner);
+    list.textContent = '';
+    if(!dir.length){ list.textContent = 'Não há outras contas de treinador.'; }
+    dir.forEach(u=>{
+      const lb = document.createElement('label');
+      lb.style.cssText = 'display:flex; gap:8px; align-items:center; cursor:pointer;';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = u.uid; cb.className = 'spShareCb';
+      cb.checked = (selected || []).indexOf(u.uid) >= 0;
+      lb.appendChild(cb); lb.appendChild(document.createTextNode((u.initials||'?')+' · '+(u.name||'')));
+      list.appendChild(lb);
+    });
+    box.style.display = 'block';
+  };
+  window.__spReadShare = function(existing){
+    const box = document.getElementById('spShareBox');
+    if(!box || box.style.display === 'none') return (existing && existing.sharedWith) || [];
+    return Array.prototype.map.call(document.querySelectorAll('#spShareList .spShareCb:checked'), x=>x.value);
+  };
   window.__spNewStudent = function(){
     try{
       spEditingStudentId = null;
@@ -9728,6 +10308,7 @@ html[data-theme="light"] .av-body-ico{
       const st = document.getElementById('spStStatus'); if(st) st.value = 'ativo';
       const msg = document.getElementById('spStMsg'); if(msg) msg.textContent = '';
       try{ spSetStPhotoPreview(null); }catch(e){}
+      try{ window.__spRenderShare([], null); }catch(e){}
       // Garantir que o separador alunos está visível
       try{ showTopTab('students'); }catch(e){}
       spShow('newStudent');
@@ -9758,6 +10339,7 @@ html[data-theme="light"] .av-body-ico{
       status: document.getElementById('spStStatus').value,
       notes: document.getElementById('spStNotes').value.trim(),
       photo: spStPhotoData !== null ? spStPhotoData : (existing ? existing.photo : null),
+      sharedWith: window.__spReadShare(existing),
       createdAt: (existing && existing.createdAt) || Date.now()
     };
     await storageSet(id, record);
@@ -9788,11 +10370,14 @@ html[data-theme="light"] .av-body-ico{
       document.getElementById('spStNotes').value = s.notes||'';
       document.getElementById('spStMsg').textContent = '';
       spSetStPhotoPreview(s.photo || null);
+      try{ window.__spRenderShare(s.sharedWith || [], id); }catch(e){}
       spShow('newStudent');
     };
     await spRenderPlanList(id);
     spShow('student');
-    document.getElementById('spDeleteStudentBtn').onclick = ()=>spDeleteStudent(id, s.name||'este aluno');
+    const _delBtn = document.getElementById('spDeleteStudentBtn');
+    _delBtn.onclick = ()=>spDeleteStudent(id, s.name||'este aluno');
+    _delBtn.style.display = (window.__elevaCanManage && !window.__elevaCanManage(id)) ? 'none' : '';
   }
   document.getElementById('spBackToList').addEventListener('click', ()=>{ spShow('list'); spRenderStudentList(); });
 
